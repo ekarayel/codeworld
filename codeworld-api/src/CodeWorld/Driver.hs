@@ -1,6 +1,7 @@
 {-# LANGUAGE CPP                      #-}
 {-# LANGUAGE DefaultSignatures        #-}
 {-# LANGUAGE DeriveGeneric            #-}
+{-# LANGUAGE FlexibleInstances        #-}
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE GADTs                    #-}
 {-# LANGUAGE JavaScriptFFI            #-}
@@ -50,9 +51,10 @@ import           Control.Concurrent.MVar
 import           Control.Concurrent.Chan
 import           Control.Exception
 import           Control.Monad
+import           Control.Monad.Reader
 import           Control.Monad.Trans (liftIO)
 import           Data.Char (chr)
-import           Data.List (zip4)
+import           Data.List (zipWith4)
 import           Data.Maybe (fromMaybe, mapMaybe)
 import           Data.Monoid
 import           Data.Serialize
@@ -188,9 +190,180 @@ getColorDS :: DrawState -> Maybe Color
 getColorDS (a,b,c,d,e,f,col) = col
 
 --------------------------------------------------------------------------------
+-- Shared implementation of drawing
+
+class (Monad m) => CanvasMonad m where
+  canvasArc :: Double -> Double -> Double -> Double -> Double -> Bool -> m ()
+  beginPath :: m ()
+  bezierCurveTo :: (Double, Double) -> (Double, Double) -> (Double, Double) -> m ()
+  closePath :: m ()
+  drawCodeWorldLogo :: DrawState -> Int -> Int -> Int -> Int -> m ()
+  fill :: m ()
+  fillRect :: Double -> Double -> Double -> Double -> m ()
+  fillStyle :: Int -> Int -> Int -> Double -> m ()
+  fillText :: Text -> (Double, Double) -> m ()
+  font :: Text -> m ()
+  lineTo :: (Double, Double) -> m ()
+  lineWidth :: Double -> m ()
+  canvasMoveTo :: (Double, Double) -> m ()
+  quadraticCurveTo :: (Double, Double) -> (Double, Double) -> m ()
+  restore :: m ()
+  scale :: Double -> Double -> m ()
+  save :: m ()
+  stroke :: m ()
+  strokeStyle :: Int -> Int -> Int -> Double -> m ()
+  transform :: Double -> Double -> Double -> Double -> Double -> Double -> m ()
+
+withDS :: (CanvasMonad m) => DrawState -> m () -> m ()
+withDS (ta,tb,tc,td,te,tf,col) action = do
+    save
+    transform ta tb tc td te tf
+    beginPath
+    action
+    restore
+
+applyColor :: (CanvasMonad m) => DrawState -> m ()
+applyColor ds = case getColorDS ds of
+    Nothing -> do
+      strokeStyle 0 0 0 1
+      fillStyle 0 0 0 1
+    Just (RGBA r g b a) -> do
+      strokeStyle (round $ r * 255)
+                  (round $ g * 255)
+                  (round $ b * 255)
+                  a
+      fillStyle (round $ r * 255)
+                (round $ g * 255)
+                (round $ b * 255)
+                a
+
+drawFigure :: (CanvasMonad m) => DrawState -> Double -> m () -> m ()
+drawFigure ds w figure = do
+    withDS ds $ do
+        figure
+        when (w /= 0) $ do
+            lineWidth (25 * w)
+            applyColor ds
+            stroke
+    when (w == 0) $ do
+        lineWidth 1
+        applyColor ds
+        stroke
+
+fontString :: TextStyle -> Font -> Text
+fontString style font = stylePrefix style <> "25px " <> fontName font
+  where stylePrefix Plain        = ""
+        stylePrefix Bold         = "bold "
+        stylePrefix Italic       = "italic "
+        fontName SansSerif       = "sans-serif"
+        fontName Serif           = "serif"
+        fontName Monospace       = "monospace"
+        fontName Handwriting     = "cursive"
+        fontName Fancy           = "fantasy"
+        fontName (NamedFont txt) = "\"" <> T.filter (/= '"') txt <> "\""
+
+drawPicture :: (CanvasMonad m) => DrawState -> Picture -> m ()
+drawPicture ds (Polygon ps smooth) = do
+    withDS ds $ followPath ps True smooth
+    applyColor ds
+    fill
+drawPicture ds (Path ps w closed smooth) = do
+    drawFigure ds w $ followPath ps closed smooth
+drawPicture ds (Sector b e r) = withDS ds $ do
+    canvasArc 0 0 (25 * abs r) b e (b > e)
+    lineTo (0, 0)
+    applyColor ds
+    fill
+drawPicture ds (Arc b e r w) = do
+    drawFigure ds w $ do
+        canvasArc 0 0 (25 * abs r) b e (b > e)
+drawPicture ds (Text sty fnt txt) = withDS ds $ do
+    scale 1 (-1)
+    applyColor ds
+    font (fontString sty fnt)
+    fillText txt (0, 0)
+drawPicture ds Logo = withDS ds $ do
+    scale 1 (-1)
+    drawCodeWorldLogo ds (-225) (-50) 450 100
+drawPicture ds (Color col p)     = drawPicture (setColorDS col ds) p
+drawPicture ds (Translate x y p) = drawPicture (translateDS x y ds) p
+drawPicture ds (Scale x y p)     = drawPicture (scaleDS x y ds) p
+drawPicture ds (Rotate r p)      = drawPicture (rotateDS r ds) p
+drawPicture ds (Pictures ps)     = mapM_ (drawPicture ds) (reverse ps)
+
+followPath :: (CanvasMonad m) => [Point] -> Bool -> Bool -> m ()
+followPath [] closed _ = return ()
+followPath [p1] closed _ = return ()
+followPath (p:ps) closed False = do
+    canvasMoveTo $ scaledVector 25 p
+    forM_ ps $ lineTo . scaledVector 25
+    when closed $ closePath
+followPath [p1, p2] False True = followPath [p1, p2] False False
+followPath ps False True = do
+    let [p1, p2, p3] = take 3 ps
+        dprev = vectorLength $ vectorDifference p1 p2
+        dnext = vectorLength $ vectorDifference p2 p3
+        p     = dprev / (dprev + dnext)
+        c     = vectorSum p2 $ scaledVector (p/2) $ vectorDifference p1 p3
+     in do canvasMoveTo $ scaledVector 25 p1
+           quadraticCurveTo (scaledVector 25 c) (scaledVector 25 p2)
+    sequence_
+        $ zipWith4 bezierSectionTo ps (tail ps) (tail $ tail ps) (tail $ tail $ tail ps)
+    let [p1, p2, p3] = reverse $ take 3 $ reverse ps
+        dp = vectorLength $ vectorDifference p2 p1
+        d1 = vectorLength $ vectorDifference p3 p2
+        r  = d1 / (dp + d1)
+        c = vectorSum p2 $ scaledVector (r/2) $ vectorDifference p3 p1
+     in quadraticCurveTo (scaledVector 25 c) (scaledVector 25 p3)
+followPath ps@(_:p:_) True True = do
+    canvasMoveTo $ scaledVector 25 p
+    let rep = cycle ps
+    sequence_
+        $ zipWith4 bezierSectionTo ps (tail rep) (tail $ tail rep) (tail $ tail $ tail rep)
+    closePath
+
+-- | Draws a section of a cubic bezier curve, given the preceeding and 
+-- succeeding points, and the actual endpoints of the curve. Assuming that the
+-- cursor is set to the starting position.
+bezierSectionTo :: (CanvasMonad m) => Point -> Point -> Point -> Point -> m ()
+bezierSectionTo preceeding start end succeeding =
+    bezierCurveTo (scaledVector 25 c1) (scaledVector 25 c2)
+                  (scaledVector 25 end)
+    where
+      dp  = vectorLength $ vectorDifference start preceeding
+      d1  = vectorLength $ vectorDifference end start
+      d2  = vectorLength $ vectorDifference succeeding end
+      p   = d1 / (d1 + d2)
+      r   = d1 / (dp + d1)
+      c1  = vectorSum start $ scaledVector (r/2) $ vectorDifference end preceeding
+      c2  = vectorSum end $ scaledVector (p/2) $ vectorDifference start succeeding
+
+--------------------------------------------------------------------------------
 -- GHCJS implementation of drawing
 
 #ifdef ghcjs_HOST_OS
+
+instance CanvasMonad (ReaderT Canvas.Context IO) where
+  canvasArc p1 p2 p3 p4 p5 p6 = ask >>= liftIO . Canvas.arc p1 p2 p3 p4 p5 p6
+  beginPath = ask >>= liftIO . Canvas.beginPath
+  bezierCurveTo (ax, ay) (bx, by) (cx, cy) = ask >>= liftIO . Canvas.bezierCurveTo ax ay bx by cx cy
+  drawCodeWorldLogo ds x y w h = ask >>= \ctx -> liftIO $ drawCodeWorldLogoImpl ctx ds x y w h
+  closePath = ask >>= liftIO . Canvas.closePath
+  fill = ask >>= liftIO . Canvas.fill
+  fillRect x y w h = ask >>= liftIO . Canvas.fillRect x y w h
+  fillStyle r g b a = ask >>= liftIO . Canvas.fillStyle r g b a
+  fillText t (x, y) = ask >>= liftIO . Canvas.fillText (textToJSString t) x y
+  font t = ask >>= liftIO . Canvas.font (textToJSString t)
+  lineTo (x, y) = ask >>= liftIO . Canvas.lineTo x y
+  lineWidth w = ask >>= liftIO . Canvas.lineWidth w
+  canvasMoveTo (x, y) = ask >>= liftIO . Canvas.moveTo x y
+  quadraticCurveTo (ax, ay) (bx, by) = ask >>= liftIO . Canvas.quadraticCurveTo ax ay bx by
+  restore = ask >>= liftIO . Canvas.restore
+  scale x y = ask >>= liftIO . Canvas.scale x y
+  save = ask >>= liftIO . Canvas.save
+  stroke = ask >>= liftIO . Canvas.stroke
+  strokeStyle r g b a = ask >>= liftIO . Canvas.strokeStyle r g b a
+  transform ta tb tc td te tf = ask >>= liftIO . Canvas.transform ta tb tc td te tf
 
 foreign import javascript unsafe "$1.drawImage($2, $3, $4, $5, $6);"
     js_canvasDrawImage :: Canvas.Context -> Element -> Int -> Int -> Int -> Int -> IO ()
@@ -213,34 +386,12 @@ getTime = (/ 1000) <$> js_getHighResTimestamp
 nextFrame :: IO Double
 nextFrame = waitForAnimationFrame >> getTime
 
-withDS :: Canvas.Context -> DrawState -> IO () -> IO ()
-withDS ctx (ta,tb,tc,td,te,tf,col) action = do
-    Canvas.save ctx
-    Canvas.transform ta tb tc td te tf ctx
-    Canvas.beginPath ctx
-    action
-    Canvas.restore ctx
-
-applyColor :: Canvas.Context -> DrawState -> IO ()
-applyColor ctx ds = case getColorDS ds of
-    Nothing -> do
-      Canvas.strokeStyle 0 0 0 1 ctx
-      Canvas.fillStyle 0 0 0 1 ctx
-    Just (RGBA r g b a) -> do
-      Canvas.strokeStyle (round $ r * 255)
-                         (round $ g * 255)
-                         (round $ b * 255)
-                         a ctx
-      Canvas.fillStyle (round $ r * 255)
-                       (round $ g * 255)
-                       (round $ b * 255)
-                       a ctx
 
 foreign import javascript unsafe "$1.globalCompositeOperation = $2"
     js_setGlobalCompositeOperation :: Canvas.Context -> JSString -> IO ()
 
-drawCodeWorldLogo :: Canvas.Context -> DrawState -> Int -> Int -> Int -> Int -> IO ()
-drawCodeWorldLogo ctx ds x y w h = do
+drawCodeWorldLogoImpl :: Canvas.Context -> DrawState -> Int -> Int -> Int -> Int -> IO ()
+drawCodeWorldLogoImpl ctx ds x y w h = do
     Just doc <- currentDocument
     Just canvas <- getElementById doc ("cwlogo" :: JSString)
     case getColorDS ds of
@@ -250,126 +401,17 @@ drawCodeWorldLogo ctx ds x y w h = do
             -- offscreen buffer as a temporary.
             buf <- Canvas.create w h
             bufctx <- js_getCodeWorldContext buf
-            applyColor bufctx ds
+            runReaderT (applyColor ds) bufctx
             Canvas.fillRect 0 0 (fromIntegral w) (fromIntegral h) bufctx
             js_setGlobalCompositeOperation bufctx "destination-in"
             js_canvasDrawImage bufctx canvas 0 0 w h
             js_canvasDrawImage ctx (elementFromCanvas buf) x y w h
 
-followPath :: Canvas.Context -> [Point] -> Bool -> Bool -> IO ()
-followPath ctx [] closed _ = return ()
-followPath ctx [p1] closed _ = return ()
-followPath ctx ((sx,sy):ps) closed False = do
-    Canvas.moveTo (25 * sx) (25 * sy) ctx
-    forM_ ps $ \(x,y) -> Canvas.lineTo (25 * x) (25 * y) ctx
-    when closed $ Canvas.closePath ctx
-followPath ctx [p1, p2] False True = followPath ctx [p1, p2] False False
-followPath ctx ps False True = do
-    let [(x1,y1), (x2,y2), (x3,y3)] = take 3 ps
-        dprev = sqrt ((x2 - x1)^2 + (y2 - y1)^2)
-        dnext = sqrt ((x3 - x2)^2 + (y3 - y2)^2)
-        p     = dprev / (dprev + dnext)
-        cx    = x2 + p * (x1 - x3) / 2
-        cy    = y2 + p * (y1 - y3) / 2
-     in do Canvas.moveTo (25 * x1) (25 * y1) ctx
-           Canvas.quadraticCurveTo (25 * cx) (25 * cy) (25 * x2) (25 * y2) ctx
-    forM_ (zip4 ps (tail ps) (tail $ tail ps) (tail $ tail $ tail ps)) $
-        \((x1,y1),(x2,y2),(x3,y3),(x4,y4)) ->
-            let dp  = sqrt ((x2 - x1)^2 + (y2 - y1)^2)
-                d1  = sqrt ((x3 - x2)^2 + (y3 - y2)^2)
-                d2  = sqrt ((x4 - x3)^2 + (y4 - y3)^2)
-                p   = d1 / (d1 + d2)
-                r   = d1 / (dp + d1)
-                cx1 = x2 + r * (x3 - x1) / 2
-                cy1 = y2 + r * (y3 - y1) / 2
-                cx2 = x3 + p * (x2 - x4) / 2
-                cy2 = y3 + p * (y2 - y4) / 2
-            in  Canvas.bezierCurveTo (25 * cx1) (25 * cy1) (25 * cx2) (25 * cy2)
-                                     (25 * x3) (25 * y3) ctx
-    let [(x1,y1), (x2,y2), (x3,y3)] = reverse $ take 3 $ reverse ps
-        dp = sqrt ((x2 - x1)^2 + (y2 - y1)^2)
-        d1 = sqrt ((x3 - x2)^2 + (y3 - y2)^2)
-        r  = d1 / (dp + d1)
-        cx = x2 + r * (x3 - x1) / 2
-        cy = y2 + r * (y3 - y1) / 2
-     in Canvas.quadraticCurveTo (25 * cx) (25 * cy) (25 * x3) (25 * y3) ctx
-followPath ctx ps@(_:(sx,sy):_) True True = do
-    Canvas.moveTo (25 * sx) (25 * sy) ctx
-    let rep = cycle ps
-    forM_ (zip4 ps (tail rep) (tail $ tail rep) (tail $ tail $ tail rep)) $
-        \((x1,y1),(x2,y2),(x3,y3),(x4,y4)) ->
-            let dp  = sqrt ((x2 - x1)^2 + (y2 - y1)^2)
-                d1  = sqrt ((x3 - x2)^2 + (y3 - y2)^2)
-                d2  = sqrt ((x4 - x3)^2 + (y4 - y3)^2)
-                p   = d1 / (d1 + d2)
-                r   = d1 / (dp + d1)
-                cx1 = x2 + r * (x3 - x1) / 2
-                cy1 = y2 + r * (y3 - y1) / 2
-                cx2 = x3 + p * (x2 - x4) / 2
-                cy2 = y3 + p * (y2 - y4) / 2
-            in  Canvas.bezierCurveTo (25 * cx1) (25 * cy1) (25 * cx2) (25 * cy2)
-                                     (25 * x3) (25 * y3) ctx
-    Canvas.closePath ctx
-
-drawFigure :: Canvas.Context -> DrawState -> Double -> IO () -> IO ()
-drawFigure ctx ds w figure = do
-    withDS ctx ds $ do
-        figure
-        when (w /= 0) $ do
-            Canvas.lineWidth (25 * w) ctx
-            applyColor ctx ds
-            Canvas.stroke ctx
-    when (w == 0) $ do
-        Canvas.lineWidth 1 ctx
-        applyColor ctx ds
-        Canvas.stroke ctx
-
-fontString :: TextStyle -> Font -> JSString
-fontString style font = stylePrefix style <> "25px " <> fontName font
-  where stylePrefix Plain        = ""
-        stylePrefix Bold         = "bold "
-        stylePrefix Italic       = "italic "
-        fontName SansSerif       = "sans-serif"
-        fontName Serif           = "serif"
-        fontName Monospace       = "monospace"
-        fontName Handwriting     = "cursive"
-        fontName Fancy           = "fantasy"
-        fontName (NamedFont txt) = "\"" <> textToJSString (T.filter (/= '"') txt) <> "\""
-
-drawPicture :: Canvas.Context -> DrawState -> Picture -> IO ()
-drawPicture ctx ds (Polygon ps smooth) = do
-    withDS ctx ds $ followPath ctx ps True smooth
-    applyColor ctx ds
-    Canvas.fill ctx
-drawPicture ctx ds (Path ps w closed smooth) = do
-    drawFigure ctx ds w $ followPath ctx ps closed smooth
-drawPicture ctx ds (Sector b e r) = withDS ctx ds $ do
-    Canvas.arc 0 0 (25 * abs r) b e (b > e) ctx
-    Canvas.lineTo 0 0 ctx
-    applyColor ctx ds
-    Canvas.fill ctx
-drawPicture ctx ds (Arc b e r w) = do
-    drawFigure ctx ds w $ do
-        Canvas.arc 0 0 (25 * abs r) b e (b > e) ctx
-drawPicture ctx ds (Text sty fnt txt) = withDS ctx ds $ do
-    Canvas.scale 1 (-1) ctx
-    applyColor ctx ds
-    Canvas.font (fontString sty fnt) ctx
-    Canvas.fillText (textToJSString txt) 0 0 ctx
-drawPicture ctx ds Logo = withDS ctx ds $ do
-    Canvas.scale 1 (-1) ctx
-    drawCodeWorldLogo ctx ds (-225) (-50) 450 100
-drawPicture ctx ds (Color col p)     = drawPicture ctx (setColorDS col ds) p
-drawPicture ctx ds (Translate x y p) = drawPicture ctx (translateDS x y ds) p
-drawPicture ctx ds (Scale x y p)     = drawPicture ctx (scaleDS x y ds) p
-drawPicture ctx ds (Rotate r p)      = drawPicture ctx (rotateDS r ds) p
-drawPicture ctx ds (Pictures ps)     = mapM_ (drawPicture ctx ds) (reverse ps)
-
 drawFrame :: Canvas.Context -> Picture -> IO ()
 drawFrame ctx pic = do
     Canvas.fillStyle 255 255 255 1 ctx
     Canvas.fillRect (-250) (-250) 500 500 ctx
-    drawPicture ctx initialDS pic
+    runReaderT (drawPicture initialDS pic) ctx
 
 setupScreenContext :: Element -> ClientRect.ClientRect -> IO Canvas.Context
 setupScreenContext canvas rect = do
@@ -415,131 +457,30 @@ drawingOf pic = display pic `catch` reportError
 
 #else
 
-withDS :: DrawState -> Canvas () -> Canvas ()
-withDS (ta,tb,tc,td,te,tf,col) action =
-    Canvas.saveRestore $ do
-        Canvas.transform (ta, tb, tc, td, te, tf)
-        Canvas.beginPath ()
-        action
+instance CanvasMonad Canvas where
+  canvasArc p1 p2 p3 p4 p5 p6 = Canvas.arc (p1, p2, p3, p4, p5, p6)
+  beginPath = Canvas.beginPath ()
+  bezierCurveTo (ax, ay) (bx, by) (cx, cy) = Canvas.bezierCurveTo (ax, ay, bx, by, cx, cy)
+  closePath = Canvas.closePath ()
+  drawCodeWorldLogo _ _ _ _ _ = return ()
+  fill = Canvas.fill ()
+  fillRect x y w h = Canvas.fillRect (x, y, w, h)
+  fillStyle r g b a = Canvas.fillStyle (rgbaStyleString r g b a)
+  fillText t (x, y) = Canvas.fillText (t, x, y)
+  font = Canvas.font
+  lineTo (x, y) = Canvas.lineTo (x, y)
+  lineWidth = Canvas.lineWidth
+  canvasMoveTo (x, y) = Canvas.moveTo (x, y)
+  quadraticCurveTo (ax, ay) (bx, by) = Canvas.quadraticCurveTo (ax, ay, bx, by)
+  restore = Canvas.restore ()
+  scale rx ry = Canvas.scale (rx, ry)
+  save = Canvas.save ()
+  stroke = Canvas.stroke ()
+  strokeStyle r g b a = Canvas.strokeStyle (rgbaStyleString r g b a)
+  transform ta tb tc td te tf = Canvas.transform (ta, tb, tc, td, te, tf)
 
-applyColor :: DrawState -> Canvas ()
-applyColor ds = case getColorDS ds of
-    Nothing -> do
-      Canvas.strokeStyle "black"
-      Canvas.fillStyle   "black"
-    Just (RGBA r g b a) -> do
-      let style = pack $ printf "rgba(%.0f,%.0f,%.0f,%f)" (r*255) (g*255) (b*255) a
-      Canvas.strokeStyle style
-      Canvas.fillStyle   style
-
-
-drawFigure :: DrawState -> Double -> Canvas () -> Canvas ()
-drawFigure ds w figure = do
-    withDS ds $ do
-        figure
-        when (w /= 0) $ do
-            Canvas.lineWidth (25 * w)
-            applyColor ds
-            Canvas.stroke ()
-    when (w == 0) $ do
-        Canvas.lineWidth 1
-        applyColor ds
-        Canvas.stroke ()
-
-followPath :: [Point] -> Bool -> Bool -> Canvas ()
-followPath [] closed _ = return ()
-followPath [p1] closed _ = return ()
-followPath ((sx,sy):ps) closed False = do
-    Canvas.moveTo (25 * sx, 25 * sy)
-    forM_ ps $ \(x,y) -> Canvas.lineTo (25 * x, 25 * y)
-    when closed $ Canvas.closePath ()
-followPath [p1, p2] False True = followPath [p1, p2] False False
-followPath ps False True = do
-    let [(x1,y1), (x2,y2), (x3,y3)] = take 3 ps
-        dprev = sqrt ((x2 - x1)^2 + (y2 - y1)^2)
-        dnext = sqrt ((x3 - x2)^2 + (y3 - y2)^2)
-        p     = dprev / (dprev + dnext)
-        cx    = x2 + p * (x1 - x3) / 2
-        cy    = y2 + p * (y1 - y3) / 2
-     in do Canvas.moveTo (25 * x1, 25 * y1)
-           Canvas.quadraticCurveTo (25 * cx, 25 * cy, 25 * x2, 25 * y2)
-    forM_ (zip4 ps (tail ps) (tail $ tail ps) (tail $ tail $ tail ps)) $
-        \((x1,y1),(x2,y2),(x3,y3),(x4,y4)) ->
-            let dp  = sqrt ((x2 - x1)^2 + (y2 - y1)^2)
-                d1  = sqrt ((x3 - x2)^2 + (y3 - y2)^2)
-                d2  = sqrt ((x4 - x3)^2 + (y4 - y3)^2)
-                p   = d1 / (d1 + d2)
-                r   = d1 / (dp + d1)
-                cx1 = x2 + r * (x3 - x1) / 2
-                cy1 = y2 + r * (y3 - y1) / 2
-                cx2 = x3 + p * (x2 - x4) / 2
-                cy2 = y3 + p * (y2 - y4) / 2
-            in  Canvas.bezierCurveTo ( 25 * cx1, 25 * cy1, 25 * cx2, 25 * cy2
-                                     , 25 * x3,  25 * y3)
-    let [(x1,y1), (x2,y2), (x3,y3)] = reverse $ take 3 $ reverse ps
-        dp = sqrt ((x2 - x1)^2 + (y2 - y1)^2)
-        d1 = sqrt ((x3 - x2)^2 + (y3 - y2)^2)
-        r  = d1 / (dp + d1)
-        cx = x2 + r * (x3 - x1) / 2
-        cy = y2 + r * (y3 - y1) / 2
-     in Canvas.quadraticCurveTo (25 * cx, 25 * cy, 25 * x3, 25 * y3)
-followPath ps@(_:(sx,sy):_) True True = do
-    Canvas.moveTo (25 * sx, 25 * sy)
-    let rep = cycle ps
-    forM_ (zip4 ps (tail rep) (tail $ tail rep) (tail $ tail $ tail rep)) $
-        \((x1,y1),(x2,y2),(x3,y3),(x4,y4)) ->
-            let dp  = sqrt ((x2 - x1)^2 + (y2 - y1)^2)
-                d1  = sqrt ((x3 - x2)^2 + (y3 - y2)^2)
-                d2  = sqrt ((x4 - x3)^2 + (y4 - y3)^2)
-                p   = d1 / (d1 + d2)
-                r   = d1 / (dp + d1)
-                cx1 = x2 + r * (x3 - x1) / 2
-                cy1 = y2 + r * (y3 - y1) / 2
-                cx2 = x3 + p * (x2 - x4) / 2
-                cy2 = y3 + p * (y2 - y4) / 2
-            in  Canvas.bezierCurveTo ( 25 * cx1, 25 * cy1, 25 * cx2, 25 * cy2
-                                     , 25 * x3, 25 * y3)
-    Canvas.closePath ()
-
-
-fontString :: TextStyle -> Font -> Text
-fontString style font = stylePrefix style <> "25px " <> fontName font
-  where stylePrefix Plain        = ""
-        stylePrefix Bold         = "bold "
-        stylePrefix Italic       = "italic "
-        fontName SansSerif       = "sans-serif"
-        fontName Serif           = "serif"
-        fontName Monospace       = "monospace"
-        fontName Handwriting     = "cursive"
-        fontName Fancy           = "fantasy"
-        fontName (NamedFont txt) = "\"" <> T.filter (/= '"') txt <> "\""
-
-drawPicture :: DrawState -> Picture -> Canvas ()
-drawPicture ds (Polygon ps smooth) = do
-    withDS ds $ followPath ps True smooth
-    applyColor ds
-    Canvas.fill ()
-drawPicture ds (Path ps w closed smooth) = do
-    drawFigure ds w $ followPath ps closed smooth
-drawPicture ds (Sector b e r) = withDS ds $ do
-    Canvas.arc (0, 0, 25 * abs r, b, e,  b > e)
-    Canvas.lineTo (0, 0)
-    applyColor ds
-    Canvas.fill ()
-drawPicture ds (Arc b e r w) = do
-    drawFigure ds w $ do
-        Canvas.arc (0, 0, 25 * abs r, b, e, b > e)
-drawPicture ds (Text sty fnt txt) = withDS ds $ do
-    Canvas.scale (1, -1)
-    applyColor ds
-    Canvas.font (fontString sty fnt)
-    Canvas.fillText (txt, 0, 0)
-drawPicture ds Logo              = return () -- Unimplemented
-drawPicture ds (Color col p)     = drawPicture (setColorDS col ds) p
-drawPicture ds (Translate x y p) = drawPicture (translateDS x y ds) p
-drawPicture ds (Scale x y p)     = drawPicture (scaleDS x y ds) p
-drawPicture ds (Rotate r p)      = drawPicture (rotateDS r ds) p
-drawPicture ds (Pictures ps)     = mapM_ (drawPicture ds) (reverse ps)
+rgbaStyleString :: Int -> Int -> Int -> Double -> Text
+rgbaStyleString r g b a = pack $ printf "rgba(%d,%d,%d,%f)" r g b a
 
 setupScreenContext :: (Int, Int) -> Canvas ()
 setupScreenContext (cw, ch) = do
